@@ -1,0 +1,768 @@
+---
+title: "Does sex really matter? Re-analysis of Morelli et al. 2026"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+author:
+  - name: Melina de Souza Leite
+    id: Ecologist and Data Scientist
+    email: melina.souza-leite@ur.de
+    affiliation: 
+      - name: Theoretical Ecology Lab
+        url: https://go.ur.de/melinaleite
+      - name: University of Regensburg
+        url: http://www.melinaleite.weebly.com
+format: 
+  html:
+    self_contained: true
+    embed-resources: true
+    toc: true
+editor: source
+---
+
+Re-analysis of the data from Morelli et al. (2026)[^1] for a commentary letter written by Melina de Souza Leite and Florian Hartig to the journal *People and Nature*.
+
+[^1]: "Morelli, F., Benedetti, Y., Mikula, P., Blumstein, D. T., Díaz, M., Page, A., Tryjanowski, P., Nowak, M. K., Vincze, E., & Lövei, G. L. (2026). Sex matters: European urban birds flee approaching women sooner than approaching men. People and Nature, 8(2), 316–326. https://doi.org/10.1002/pan3.70226"
+
+
+```{r, echo=F}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = T, warning = F, fig.align = "center", message = F,
+  error = F, cache = T)
+```
+
+```{r}
+## used packages --------------
+library(brms) 
+library(readxl)
+library(tidyverse)
+library(broom.mixed)
+library(patchwork)
+library(cowplot); theme_set(theme_cowplot())
+library(performance)
+library(DHARMa)
+library(ape)
+library(phangorn)
+library(MCMCglmm)
+```
+
+# Datasets
+
+## Experiment data
+
+Data publised on [Figshare: https://doi.org/10.6084/m9.figshare.28284848.v1](https://doi.org/10.6084/m9.figshare.28284848.v1).
+
+```{r, warning=F}
+data <- read_excel("data/fid10DB_article.xlsx")
+nrow(data)
+sort(table(data$Species), decreasing=T) 
+table(data$gender)
+```
+
+The data described in the Results section of Morelli et al. 2026 match for the selected data of 2581 observations (for species \>=10 observations).
+
+Note, there are two values of 0 `FID`.
+
+```{r}
+sum(data$FID == 0)
+```
+
+According to the Methods section 2.2 Statistica analyses, the data on species _Corvus cornix_ (N=35) should to be merged to _Corvus corone_. However, as noticed in Table 2 (Morelli et al. 2026), the data for the model has 38 species, not 37 as it should be if the species were merged. I'll create an additional column with the corrected species name and keep the original as it is.
+
+```{r}
+sum(data$Species == "Corvus cornix")
+data$Species.mod <- data$Species
+data$Species.mod[data$Species.mod == "Corvus cornix"] <- "Corvus corone"
+```
+
+
+## Bird phylogeny
+
+The phylogenetic bird trees data were shared by the corresponding author, Federico Morelli, via email on June 15, 2026.
+
+```{r}
+phylo <- read.nexus("data/fid10tree2.nex")
+```
+
+The file has 100 phylogenetic trees. According to Morelli's email instructions we have to run:
+
+```{r, fig.height=8}
+MCC <- maxCladeCred(phylo, tree = TRUE, part = NULL, rooted = TRUE) 
+birdtree <- as.phylo(MCC)
+plot(birdtree)
+```
+
+Checking names between dataset (`Species.mod`) and tree tips.
+
+```{r}
+sp.data <- sub(" ", "_", unique(data$Species.mod)) |> sort()
+sp.tree <- sort(birdtree$tip.label)
+identical(sp.data, sp.tree)
+data$Phylo <- gsub(" ", "_", data$Species.mod) # creating phylo in dataset
+```
+
+Setting node labels with sequential values (inverseA function complains if not).
+
+```{r}
+birdtree$node.label <- NA
+```
+
+Creating the phylogenetic covariance matrix using the ‘inverseA’ function in the ‘MCMCglmm’ v. 2.32 package (Hadfield, 2010) as described in the methods:
+
+```{r}
+phylo.cov <- MCMCglmm::inverseA(birdtree)
+```
+
+However, following the `brms` vignette, we should have the covariance matrix, not its inverse (as done in `inverseA` above):
+
+```{r}
+phylo.cov2 <- ape::vcv.phylo(birdtree, corr = TRUE)
+```
+
+**Note**: we tested both phylogenetic covariance matrices but kept `phylo.cov2`, because it seems more correct and delivers larger residual variance for the phylogenetic relationship (0.37, compared to 0.03 for the inverse matrix `phylo.cov`) as we would expect.
+
+
+# Data Exploration
+
+```{r}
+summary(data$FID)
+hist(data$FID)
+hist(log(data$FID))
+
+length(table(data$ID.Area))
+summary(as.numeric(table(data$ID.Area)))
+table(data$City)
+```
+
+## Observer's characteristics
+
+```{r}
+table(data$Observer, data$gender)
+table(data$Observer, data$City)
+table(data$Observer, data$Country)
+table(data$Observer, data$Clothes.dominant.colour, useNA = "always")
+```
+
+Most obsevers (6) just used one or two types of colors, and the pairs of observers seemed to use the same colors. However, a potential issue here is the largest amount of observartions from two observers (Marta & Piotr) without any color information (788 NAs):
+
+```{r}
+table(data$Observer[data$Observer %in% c("Alicia", "Mario")], 
+      data$Clothes.dominant.colour[data$Observer %in% c("Alicia", "Mario")])
+table(data$Observer[data$Observer %in% c("Girl1", "Peter")], 
+      data$Clothes.dominant.colour[data$Observer %in% c("Girl1", "Peter")])
+table(data$Observer[data$Observer %in% c("Benedetti", "Morelli")], 
+      data$Clothes.dominant.colour[data$Observer %in% c("Benedetti", "Morelli")])
+table(data$Observer[data$Observer %in% c("Marta Nowak", "Piotr Tryjanowski")], 
+      data$Clothes.dominant.colour[data$Observer %in% c("Marta Nowak",
+                                                        "Piotr Tryjanowski")],
+      useNA="always")
+```
+
+## Other variables
+
+```{r}
+hist(data$Flock)
+hist(data$Built)
+hist(data$Grass)
+hist(data$Bare.soil)
+hist(data$Water)
+hist(data$Tree)
+hist(data$Bush)
+```
+
+Relationship FID and SD (starting distance). Given these constraints, this would suggest not only that FID depends on SD but that the variance of FID increases also with SD (heteroscedasticity).
+
+```{r}
+ggplot(data, aes(x=SD, y=FID)) + geom_point() +
+  geom_abline(a=0,b=1)
+```
+
+## NAs in the data
+
+```{r}
+fun.na <- function(x){ sum(is.na(x))}
+apply(data,2, fun.na)
+sum(is.na(data$Sex))
+```
+
+For the model, the dataset is missing 1629 observations due to the NAs in bird sex.
+
+By removing those observations, the remaining dataset ends up with `r nrow(data)-sum(is.na(data$Sex))` observations (with two observations of FID=0).
+
+# Preparing data for modeling
+Scaling continous predictor variables and removing the NAs.
+
+```{r}
+data.s <- data %>%
+  mutate_at(vars(SD, Flock,Built,Grass,Bare.soil,Water,Tree,Bush), scale) %>%
+  mutate_at(vars(SD, Flock,Built,Grass,Bare.soil,Water,Tree,Bush), as.numeric) %>%
+  select(FID, SD, Flock, Sex, gender, Built, Grass, Bare.soil, Water, Tree, 
+         Bush, Species,Species.mod, Phylo, City, Observer) %>%
+  drop_na()
+```
+
+**NOTE**: Even if we keep the NAs in the data they would be excluded from the model by `brms`.
+
+# Original model
+
+We followed the Methods section of Morelli et al. 2026 and tried to reproduce it below:
+
+```{r,echo=T, eval=F}
+mod.orig <- brm(FID ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s, 
+                data2 = list(A = phylo.cov2),
+                family = gaussian(link="log"),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+
+# saving model
+save(mod.orig, file="models/mod.orig.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.orig.Rdata")
+```
+
+## Model summary:
+
+```{r}
+summary(mod.orig)
+#tidy(mod.orig)
+```
+
+Our model results were qualitatively similar to **Table 2**, especially regarding the `gendermale` coefficient ("significant"): our model -0.12 (-0.20 to -0.03 95% CIs) and Table 2 -0.14 (-0.19 to -0.09). Some other coefficients changed more: `sexM`, `Tree` became "non-significant" (see figure comparing all coefficients below).
+
+R-squares differ a bit from **Table 2**, but remain qualitatively comparable.
+
+```{r}
+r2_bayes(mod.orig)
+```
+
+## Model diagnostic
+
+Conditional residuals
+
+```{r}
+res.origc <- simulateResiduals(mod.orig, simulateREs = "conditional")
+plot(res.origc)
+#plotResiduals(res.origc, form = ~.)
+plotResiduals(res.origc, form = as.factor(data.s$Observer))
+```
+
+Unconditional residuals
+
+```{r}
+res.orig <- simulateResiduals(mod.orig, simulateREs = "unconditional")
+plot(res.orig)
+#plotResiduals(res.orig, form = ~.)
+plotResiduals(res.orig, form = as.factor(data.s$Observer))
+```
+
+Residuals diagnostic show that model is not well fit to the data. Two potential reasons for that are: (1) to use a gaussian model with log link function (as discussed in the Alternative models section), and (2) the heteroscedasticity created by SD. We have some evidence for (2) with the plot below (for details see the help file of `plotResiduals` and `absoluteDeviation=T`: 
+
+```{r}
+plotResiduals(res.orig, form=~SD, absoluteDeviation = T)
+```
+
+
+# Model with observer identity as random intercept
+
+```{r, echo=T, eval=F}
+mod.obs <- brm(FID ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|Observer) + 
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s, 
+                data2 = list(A = phylo.cov2),
+                family = gaussian(link="log"),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+# saving model
+save(mod.obs, file="models/mod.obs.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.obs.Rdata")
+```
+
+## Model summary
+
+```{r}
+summary(mod.obs)
+#tidy(mod.orig)
+```
+
+```{r}
+r2_bayes(mod.obs)
+```
+
+Adding `Observer` as random intercept changes a lot the intrepretation of the model:
+
+- First, we can see that `City` random intercept decreases from 0.36 in the original model (see summary `mod.orig`) to 0.10 in this model. Because each city contributes essentially one woman and one man (although some pair visited more than one city), the geographical "city" and, thus, country effect (consistency) was confounded with the observer effect.
+
+- Second, and most importantly, the credibility intervals for the `gendermale` coefficient got wider, ranging from -0.71 to 0.37, evidencing the larger uncertainty in the observer gender effect on FID once controled by observer variance.
+
+
+## Model diagnostic
+
+Conditional
+
+```{r}
+res.obsc <- simulateResiduals(mod.obs, simulateREs = "conditional")
+plot(res.obsc)
+#plotResiduals(res.obsc, form = ~.)
+plotResiduals(res.obsc, form = as.factor(data.s$Observer))
+```
+
+Unconditional
+
+```{r}
+res.obs <- simulateResiduals(mod.obs, simulateREs = "unconditional")
+plot(res.obs)
+#plotResiduals(res.obs, form = ~.)
+plotResiduals(res.obs, form = as.factor(data.s$Observer))
+```
+
+```{r}
+plotResiduals(res.obs, form=~SD, absoluteDeviation = T)
+```
+
+Same patterns in residuals, suggesting model fit problems.
+
+# Comparative figure
+
+Table 2 original coefficients:
+
+```{r}
+tab2 <-  data.frame(term = tidyMCMC(mod.orig)$term[1:13],
+                    estimate = c(2.2, 0.21, -0.06, -0.13, -0.14, 0.01, -0.01, 
+                                 0.01, -0.02, 0.10, -0.09, 0.23, 0.55),
+                    conf.low = c(1.64, 0.19, -0.09, -0.23, -0.19, -0.02, -0.05,
+                                 -0.03, -0.05, 0.07, -0.12, 0.01, 0.41),
+                    conf.high = c(2.79, 0.23, -0.03, -0.03, -0.09, 0.04, 0.03,
+                                  0.05, 0.02, 0.13, -0.05, 0.52, 0.75))
+#tab2
+```
+
+All coefficients
+
+```{r, fig.height=10, fig.width=8}
+coefs <- bind_rows(list(original = tab2,
+                      reprod = tidyMCMC(mod.orig, conf.int = T)[1:14,],
+                      reprod_obsRE = tidyMCMC(mod.obs, conf.int=T)[1:15,]),
+                   .id="model") %>%
+  mutate(model = fct_relevel(model, "reprod_obsRE", "reprod", "original"))
+ggplot(coefs, aes(x=estimate, y=term, col=model, group=model, xmin=conf.low, 
+                  xmax=conf.high))+ 
+  geom_pointrange(position = position_dodge(width = 0.7))+
+  geom_vline(xintercept = 0, linetype='dashed', col= "gray")+
+    scale_color_manual(name="Models", values= c( "#22A884FF", "#E16462FF",
+                                                 "#FCA636FF"))+ 
+  theme_bw() +
+  facet_wrap(~term, scales="free", ncol=3) +
+  theme(legend.position = "top")
+```
+
+Figure 1 in the main text:
+
+```{r}
+pA <- coefs %>% filter(term %in% c("b_gendermale")) %>%
+  ggplot( aes(x=estimate, y=term, col=model, xmin=conf.low, xmax=conf.high))+ 
+  geom_pointrange(position = position_dodge(width = 0.7)) +
+  scale_y_discrete(labels = expression(beta["_male"]), name = "")+
+  scale_color_manual(name="Models", values= c( "#22A884FF", "#E16462FF","#FCA636FF"))+ 
+  ggtitle("Observer sex (male)")+
+  labs(tag="A)")+
+  geom_vline(xintercept = 0, linetype="dashed")+
+  theme_bw() + 
+  theme(legend.position="none",
+        axis.text.y = element_text(size=12),
+        panel.grid.major.y = element_blank()) 
+```
+
+```{r}
+pB<- coefs %>% filter(term %in% c("sd_Species__Intercept", "sd_City__Intercept",
+                            "sd_Phylo__Intercept", "sd_Observer__Intercept" )) %>%
+  mutate(term = fct_relevel(term,"sd_Observer__Intercept", "sd_City__Intercept",
+                            "sd_Species__Intercept","sd_Phylo__Intercept")) %>%
+  mutate(term = fct_recode(term, `Phylo` = "sd_Phylo__Intercept",
+                           `Species` ="sd_Species__Intercept",
+                           `City` = "sd_City__Intercept",
+                           `Observer` = "sd_Observer__Intercept")) %>%
+  mutate(model = fct_recode(model, 
+                            `Original model \n (Table 2)` = "original", 
+                            `Reproduced model` = "reprod",
+                            `Reproduced model  \n + observer RE`="reprod_obsRE")) %>%
+  ggplot( aes(x=estimate, y=term, col=model, xmin=conf.low, xmax=conf.high))+ 
+  geom_pointrange(position = position_dodge(width = 0.7))+
+  scale_y_discrete(name="")+
+  scale_color_manual(name="Models", values= c( "#22A884FF", "#E16462FF","#FCA636FF"))+ 
+  ggtitle("Random intercepts SD")+
+  labs(tag="B)")+
+  geom_hline(yintercept = c(1.5,2.5), col="gray95")+
+  geom_vline(xintercept = 0, linetype="dashed")+
+  guides(color = guide_legend(reverse = TRUE))+
+  theme_bw()  +
+  theme(legend.key.spacing.y = unit(0.5, "cm"),
+        legend.title = element_text(margin = margin(b = 15)),
+        panel.grid.major.y = element_blank()) 
+```
+
+```{r, fig.height=8}
+pA / pB + plot_layout(height=c(0.3,1), guides = "collect")
+ggsave("figures/Figure1_compareModels.png", height = 6, width=6)
+```
+
+
+Rsquared
+
+```{r}
+r2_table2 <- data.frame(Component = c("conditional", "marginal"),
+                        R2 = c(0.33, 0.17),
+                        CI_low = c(0.31,0.03),
+                        CI_high = c(0.35, 0.34))
+
+r2s <- bind_rows(list(original = r2_table2,
+                      reprod = r2_bayes(mod.orig) |> as.data.frame(),
+                      reprod_obsRE = r2_bayes(mod.obs) |> as.data.frame()),
+                 .id="model")
+
+r2s %>%
+    mutate(model = fct_relevel(model, "reprod_obsRE", "reprod", "original")) %>%
+  mutate(Component = fct_relevel(Component, "marginal", "conditional")) %>%
+  mutate(model = fct_recode(model, 
+                            `Original model \n (Table 2)` = "original", 
+                            `Reproduced model` = "reprod",
+                            `Reproduced model  \n + observer RE`="reprod_obsRE")) %>%
+  ggplot( aes(x=R2, y=Component, col=model, xmin=CI_low, xmax=CI_high))+ 
+  geom_pointrange(position = position_dodge(width = 0.7))+
+  scale_y_discrete(name="")+
+  scale_color_manual(name="Models", values= c( "#22A884FF", "#E16462FF","#FCA636FF"))+ 
+  ggtitle("R-squared") +
+  geom_hline(yintercept = c(1.5,2.5), col="gray95")+
+  geom_vline(xintercept = 0, linetype="dashed")+
+  guides(color = guide_legend(reverse = TRUE))+
+  theme_bw()  +
+  theme(legend.key.spacing.y = unit(0.5, "cm"),
+        legend.title = element_text(margin = margin(b = 15)),
+        panel.grid.major.y = element_blank()) 
+ggsave("figures/Figure_Rsquared.png")
+```
+
+
+
+# Extra: Alternative models
+
+The original model described in Morelli et al. 2026 is a gaussian model with a log link function (`gaussian(link = “log”)`). That is, it models the **mean** on the log scale while maintaining **Gaussian errors** (symmetric, constant variance) on the response scale. Note that this is not equivalent to log-transforming the FID and assuming a gaussian distribution. 
+
+We believe there are other alternative models that could fit better the data, such as:
+
+1)  A gaussian model with cannonical link function (identity), but with log of FID as response variable.
+
+2)  A lognormal model with cannonical link funciton (log).
+
+3)  A gamma model with log link function.
+
+For these alternative models, we removed the 2 observartions with 0 FID, as the data must be strictly positive:
+
+```{r}
+data.s2 <- data.s[data.s$FID >0,]
+```
+
+In summary, the gaussian model with log(FID) and the gamma model presented the best fit.
+
+## 1) Gaussian with log(FID)
+
+Gaussian but with log(FID) as response variable.
+
+```{r, eval=F}
+mod.alt1 <- brm(log(FID) ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s2, 
+                data2 = list(A = phylo.cov2),
+                family = gaussian(),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+
+# saving model
+
+# saving model
+save(mod.alt1, file="models/mod.alt1.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.alt1.Rdata")
+
+summary(mod.alt1) 
+r2_bayes(mod.alt1) 
+```
+
+Although `gendermale` coefficient remains "significant", this model has more differences with Table 2 than the first model. So, we keep our inference based on the first "original model" above.
+
+#### Model diagnostic
+
+```{r}
+res.alt1 <- simulateResiduals(mod.alt1, simulateREs = "conditional")
+plot(res.alt1)
+plotResiduals(res.alt1, form = as.factor(data.s2$Observer))
+```
+
+```{r, fig.height=6}
+plotResiduals(res.alt1, form = ~SD + Flock + Sex + gender + Built + Grass +
+                  Bare.soil +Water + Tree + Bush)
+```
+
+
+```{r}
+plotResiduals(res.alt1, form=~SD, absoluteDeviation = T)
+```
+
+
+### Adding observer ID
+
+The same conclusions applies here when adding observer ID random intercept.
+
+```{r, eval=F}
+mod.obs.alt1 <- brm(log(FID) ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|Observer) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s2, 
+                data2 = list(A = phylo.cov2),
+                family = gaussian(),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+
+# saving model
+save(mod.obs.alt1, file="models/mod.obs.alt1.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.obs.alt1.Rdata")
+summary(mod.obs.alt1) 
+r2_bayes(mod.obs.alt1) 
+```
+
+#### Model diagnostic
+
+```{r}
+res.obs.alt1 <- simulateResiduals(mod.obs.alt1, simulateREs = "conditional")
+plot(res.obs.alt1)
+plotResiduals(res.obs.alt1, form = as.factor(data.s2$Observer))
+```
+
+```{r, fig.height=6}
+plotResiduals(res.obs.alt1, form = ~SD + Flock + Sex + gender + Built + Grass +
+                  Bare.soil +Water + Tree + Bush)
+```
+
+## 2) Lognormal distribution
+
+Lognormal distribution.
+
+```{r, eval=F}
+mod.alt2 <- brm(FID ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s2, 
+                data2 = list(A = phylo.cov2),
+                family = lognormal(),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+
+# saving model
+save(mod.alt2, file="models/mod.alt2.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.alt2.Rdata")
+
+summary(mod.alt2) 
+r2_bayes(mod.alt2) 
+```
+
+Although `gendermale` coefficient remains "significant", this model has more differences with Table 2 than the first model. So, we keep our inference based on the first "original model" above.
+
+#### Model diagnostic
+
+```{r}
+res.alt2 <- simulateResiduals(mod.alt2, simulateREs = "unconditional")
+plot(res.alt2)
+plotResiduals(res.alt2, form = as.factor(data.s2$Observer))
+```
+
+```{r, fig.height=6}
+plotResiduals(res.alt2, form = ~SD + Flock + Sex + gender + Built + Grass +
+                  Bare.soil +Water + Tree + Bush)
+```
+
+### Adding observer ID
+
+The same conclusions applies here when adding observer ID random intercept.
+
+```{r, eval=F}
+mod.obs.alt2 <- brm(FID ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|Observer) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s2, 
+                data2 = list(A = phylo.cov2),
+                family = lognormal(),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+# saving model
+save(mod.obs.alt2, file="models/mod.obs.alt2.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.obs.alt2.Rdata")
+summary(mod.obs.alt2) 
+r2_bayes(mod.obs.alt2) 
+```
+
+### Model diagnostic
+
+```{r}
+res.obs.alt2 <- simulateResiduals(mod.obs.alt2, simulateREs = "conditional")
+plot(res.obs.alt2)
+plotResiduals(res.obs.alt2, form = as.factor(data.s2$Observer))
+```
+
+```{r, fig.height=6}
+plotResiduals(res.alt2, form = ~SD + Flock + Sex + gender + Built + Grass +
+                  Bare.soil +Water + Tree + Bush)
+```
+
+## 3) Gamma distribution
+
+Gamma distribution
+
+```{r, eval=F}
+mod.alt3 <- brm(FID ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s2, 
+                data2 = list(A = phylo.cov2),
+                family = Gamma(link="log"),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+# saving model
+save(mod.alt3, file="models/mod.alt3.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.alt3.Rdata")
+
+summary(mod.alt3) 
+r2_bayes(mod.alt3) 
+```
+
+Although `gendermale` coefficient remains "significant", this model has more differences with Table 2 than the first model. So, we keep our inference based on the first "original model" above.
+
+#### Model diagnostic
+
+```{r}
+res.alt3 <- simulateResiduals(mod.alt3, simulateREs = "conditional")
+plot(res.alt3)
+plotResiduals(res.alt3, form = as.factor(data.s2$Observer))
+```
+
+```{r, fig.height=6}
+plotResiduals(res.alt3, form = ~SD + Flock + Sex + gender + Built + Grass +
+                  Bare.soil +Water + Tree + Bush)
+```
+
+### Adding observer ID
+
+The same conclusions applies here when adding observer ID random intercept.
+
+```{r, eval=F}
+mod.obs.alt3 <- brm(FID ~ SD + Flock + Sex + gender + Built + Grass +
+                      Bare.soil + Water + Tree + Bush + (1|City) + (1|Species) +
+                      (1|Observer) +
+                      (1|gr(Phylo, cov = A)),  # phylo matrix
+                data = data.s2, 
+                data2 = list(A = phylo.cov2),
+                family = Gamma(link="log"),
+                cores = 2, chains = 2,
+                warmup = 1000, iter = 2000, 
+                control = list(adapt_delta =0.99, max_treedepth=15))
+# saving model
+save(mod.obs.alt3, file="models/mod.obs.alt3.Rdata")
+```
+
+```{r,echo=F}
+#loading saved model
+load("models/mod.obs.alt3.Rdata")
+summary(mod.obs.alt3) 
+r2_bayes(mod.obs.alt3) 
+```
+
+#### Model diagnostic
+
+```{r}
+res.obs.alt3 <- simulateResiduals(mod.obs.alt3, simulateREs = "conditional")
+plot(res.obs.alt3)
+plotResiduals(res.obs.alt3, form = as.factor(data.s2$Observer))
+```
+
+```{r, fig.height=6}
+plotResiduals(res.obs.alt3, form = ~SD + Flock + Sex + gender + Built + Grass +
+                  Bare.soil +Water + Tree + Bush)
+```
+
+# Technical notes and Session info
+
+## R and package versions
+
+The analysis here used more recent versions of R and the packages described by the authors (see session info below):
+
+- R version 4.5.2, instead of 4.1.1
+
+- brms version 2.23, instead of 2.16.3 (paper says 2.6.13, as there is no such version, we believe it was a typo for version 2.16.3)
+
+- MCMCglmm version 2.36, instead of 2.32
+
+- phangorn version 2.12.1, instead of 2.8.1
+
+This could the one of the reasons for not being able to reproduce the results of the model entirely. To check that, we created a container with the specified versions of the packages by the paper (except R that was 4.3.3), and run the original model. 
+
+However, the reproduced results in the container were very similar to the ones we have here:
+
+```{r}
+load("models/mod.orig_container.Rdata")
+summary(mod.orig_container)
+```
+
+So, we are unsure of not getting the same results as the original paper and, as we didn't have access to the original code, we cannot reproduce it entirely.
+
+## Model without the phylogenetic covariance matrix
+
+None of our results were similar to **Table S5**, where the authors say it was supposed to be results for the model without the phylogenetic tree. We noticed that **Table S5** does not seem to come from a bayesian model, since the coefficients are quite different also from the main model in **Table 2**.
+
+We could consider fitting an alternative model with the most popular R packages for GLMMs to try to reproduce this model too, but this is beyond our goals. 
+
+
+
+## Session info for this analysis
+
+
+```{r}
+sessionInfo()
+```
