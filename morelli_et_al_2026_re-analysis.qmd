@@ -77,7 +77,7 @@ data$Species.mod[data$Species.mod == "Corvus cornix"] <- "Corvus corone"
 
 ## Bird phylogeny
 
-The phylogenetic bird trees data were shared by the corresponding author, Federico Morelli, via email on June 15, 2026.
+The phylogenetic bird trees data were shared by the corresponding author, Federico Morelli, via email on June 15, 2026. However, the same tree could be downloaded from [birdtree.org](https://birdtree.org/) using the paper's instructions. 
 
 ```{r}
 phylo <- read.nexus("data/fid10tree2.nex")
